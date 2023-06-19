@@ -1,0 +1,876 @@
+---
+title: "Calibration of Leicester score and enhanced scores"
+author: "XL,TL,JC,LC,DH"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  word_document:
+      fig_width: 8
+      fig_height: 5
+      reference_docx: "K:/TEU/TEU_Guides/TEU_DocStyle_Rmd_2020.dotx"
+---
+
+**Keywords**: 45% of the cohort, incident T2D derived from HES/Dth/PC censored till 2016.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(dplyr)
+library(survival)
+library(survminer)
+library(Rcpp)
+library(summarytools)
+library(arsenal)
+library(pander)
+library(ggeffects)
+library(sjPlot)
+library(etm)
+library(readr)
+library(tibble)
+library(ResourceSelection)
+library(Publish)
+library(rsample)
+library(plotROC)
+library(pROC)
+library(nricens)
+library(PredictABEL)
+library(cutpointr)
+library(caret)
+library(gridExtra)
+library(riskRegression)
+library(gtools)
+library(ggsurvfit)
+# Specify the markdown format for knitr tables, otherwise they're not compatible with kableExtra
+#options(knitr.kable.NA='', knitr.table.format = "html")
+#options(kableExtra.auto_format = FALSE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions))
+source(here::here(config$scripts$nri))
+
+my_controls <- tableby.control(
+    test = F,
+    total = T,
+    #numeric.test = "kwt", cat.test = "chisq",
+    numeric.stats = c("meansd", "medianq1q3", "range", "Nmiss"), 
+    cat.stats = c("countpct", "Nmiss"),
+    stats.labels = list(
+      meansd = "Mean (SD)",
+      medianq1q3 = "Median (IQR)",
+      range = "Min - Max",
+      Nmiss = "Missing",
+      Npct="N (Pct)"
+    ),
+    digits = 2L
+  )
+
+# Read in data derived from code chunk below
+data<-readRDS(here::here(file.path(config$data$derived,"data_Leicrs.RDS")))
+
+tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
+tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
+
+
+```
+
+```{r,include=FALSE}
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+pretty_func <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type = "function")
+pretty_names <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type="list")
+
+pretty_names$hba1c_cat="HbA1c at baseline"
+pretty_names$hba1c_cat2="HbA1c at baseline"
+
+pretty_names$BSM_WaistCirc_Cat="Waist circumference,cm"
+pretty_names$BSM_BMI_Cat="BMI"
+pretty_names$HighBP="Antihypertensive meds or high blood pressure"
+pretty_names$diab_rs_cat="Leicester risk score"
+pretty_names$PRS_quintiles="T2D PRS quintiles"
+pretty_names$Ethnicity="Ethnicity"
+
+pretty_names$diab_rs="LRA Score"
+pretty_names$Eth_rs="LRArev Score"
+pretty_names$PRS_rs="LRAprs Score"
+```
+
+
+# Introduction
+
+We are interested in assessing calibration of 10-year T2D risk. Since the maximum follow-up of quintile 2 of the enhanced score (with PRS) in test data was less than 10 years (see KM plot at the end of this document), we decided to compare predicted 10-year risk and observed 9-year risk (an approximate for observed 10-year risk). 
+
+
+# Leicester score (Training)
+
+First, we calculated the predicted probability from the intercept and beta coefficients of the Leicester score model. 
+
+Then we followed the same approach for calibration discussed in [Sun2021](https://pubmed.ncbi.nlm.nih.gov/33444330/) where we compared the observed and predicted risks across deciles of predicted risk. 
+
+```{r pred prob Leicrs}
+
+tot_train<-tot_train%>%select(!starts_with("RS_"))
+
+# Leicester risk score vars
+columns=c("TEU_BaC_AgeCat","BaC_Sex","Ethnicity","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+rs_train<-cbind(tot_train, setNames(tot_train[columns], paste0("RS_", columns)))
+
+rs_train<-rs_train%>%
+  mutate_at(paste0("RS_",columns), ~var_to_beta(.))
+
+# Sum all the columns starting with RS_
+
+rs_train<-rs_train%>%
+  mutate(sum_beta=-3.430668+rowSums(select(.,starts_with("RS_"))))%>%
+  mutate(Leicrs_prob=exp(sum_beta)/(1+exp(sum_beta)))
+
+
+```
+
+
+```{r}
+#Check if this probability actually makes sense 
+tabs<-rs_train%>%group_by(diab_rs_cat)%>%summarise(p=mean(Leicrs_prob))
+
+tabs<-tabs%>%mutate(
+             p_website=case_when(diab_rs_cat=="Low:0-6" ~ 1/100,
+                           diab_rs_cat=="Increased:7-15" ~ 1/35,
+                           diab_rs_cat=="Moderate:16-24" ~ 1/10,
+                           diab_rs_cat=="High:25-47" ~ 1/4))
+
+pander(tabs,caption = "Predicted probability of the Leicester score model by risk groups. Column p shows the probability computed using the betas of Leicester score and column p_website shows the probability from the Diabetes UK website.")
+
+#rs_train%>%group_by(diab_rs_cat)%>%summarise(n=n(),cases=sum(TEU_T2DM_status))%>%mutate(obs_p=cases/n)
+```
+
+(XL, 08Feb2023): Previously, we categorised participants into deciles groups then plotted the calibration but due to the small number of individuals with 10-year follow-up, we categorised participants into quintiles groups.
+
+We first plotted the KM plot by quintiles of predicted probability from the Leicester model using the training data. 
+
+
+```{r KM by quintiles}
+
+rs_train<-rs_train%>%mutate(
+    pred_groups=Percentile(Leicrs_prob,probs=seq(0, 1, 1/5),labels = c(1:5),right=TRUE))
+  
+survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_groups, data = rs_train) %>% 
+  ggsurvfit() +
+  labs(
+    title = "KM plot by quintiles of predicted probability from the Leicester model \n using the training data",
+    x = "Years",
+    y = "Overall survival probability"
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+
+```
+
+
+In the calibration plots below, each blue square represents a quintile group. The x-axis shows the mean of predicted probability (computed from betas of the Leicester model) within each quintile group and the y-axis shows the observed risk at 9 years estimated using UKB data within each quintile group.
+
+Title: Calibration plot of the Leicester score with 10-year risk of T2D using the training data.
+
+```{r Leicprob calibration}
+
+Leic10_cal<-Calibration_df(data=rs_train,predRisk="Leicrs_prob",groups=5,times=9,format="wide")
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+ggplot(Leic10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  scale_x_continuous(limits = c(0,0.3)) +
+  scale_y_continuous(limits=c(0,0.3)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+```{r RP presentation Leicprob,eval=FALSE}
+
+pred_obs<-Calibration_df(data=rs_train,predRisk="Leicrs_prob",groups=10,times=10,format="long")
+  
+#Plot observed vs predicted 
+ggplot(pred_obs, aes(group, value, colour = variable)) + 
+                  geom_point(size = 3, shape=19) + 
+                  labs(title = "Calibration of the Leicester score at ten years using the training data.", x = "10th predicted risk", y = "10-year T2D risk") +
+                  scale_color_manual(labels = c("Pred"="Predicted risk from Leicester score", "Obs"="Observed risk"), 
+                                     values = c("Pred"="blue", "Obs"="red")) + 
+                  theme(legend.title = element_blank())
+```
+
+
+# Enhanced score without PRS (Training)
+
+We computed the predicted probability of developing T2D within 10 years specified below using the betas of the enhanced model (without PRS) and plotted them against observed 9-year risk.
+
+```{r}
+
+# Model 1: Ethnicity + other Leicester vars
+
+RFs=c("TEU_BaC_AgeCat","BaC_Sex","TEU_ethnicgrp","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+formula<-as.formula(paste0("Surv(TEU_T2DM_time,TEU_T2DM_status)~",
+                           paste(RFs, collapse="+")))
+
+
+Eth_model<-coxph(formula,data = tot_train,x=TRUE)
+
+# Create list of betas 
+Eth_model_betas<-Eth_model$coefficients
+
+Eth_model_betas<-data.frame(round(Eth_model_betas*10,0))
+
+Eth_model_betas <- tibble::rownames_to_column(Eth_model_betas, "VALUE")
+colnames(Eth_model_betas)<-c("VALUE","New Score 1")
+
+# Present our model 
+Eth_model_output<-printcoxresults(df=tot_train,varlist=RFs,modeloutput = Eth_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE)
+
+```
+
+```{r PRS model}
+
+# Fit a model
+vars=c(RFs,"PRS_quintiles","GeP_Array")
+
+formula<-as.formula(paste0("Surv(TEU_T2DM_time,TEU_T2DM_status)~",
+                           paste(vars, collapse="+")))
+
+
+PRS_model<-coxph(formula,data = tot_train,x=TRUE)
+
+```
+
+
+```{r}
+# Compute the predicted probability
+rs_train<-rs_train%>%
+  mutate(# Predicted 10-year risk score (RS)
+    eth_prob10=1-predictCox(Eth_model,times=10,newdata = rs_train)$survival,
+    eth_PRS_prob10=1-predictCox(PRS_model,times=10, newdata = rs_train)$survival)
+
+```
+
+Title: Calibration plot of the enhanced score (without PRS) with 10-year risk of T2D using the training data.
+
+```{r}
+
+enh_calib10<-Calibration_df(predRisk = "eth_prob10",data=rs_train,groups=5,times=9,format="wide")
+
+ggplot(enh_calib10, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  scale_x_continuous(limits = c(0,0.3)) +
+  scale_y_continuous(limits=c(0,0.3)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+```
+
+
+# Enhanced score with PRS (Training)
+
+We computed the predicted probability of developing T2D within 10 years using the betas of the enhanced model (with PRS) and plotted them against the observed 9-year risk.
+
+Note: We incorporated the genetic array information when computing the predicted probability because I am not sure how to compute predicted probability regardless of the genetic array.
+
+Title: Calibration plot of the enhanced score (with PRS) with 10-year risk of T2D using the training data
+
+```{r}
+
+enh_PRS_calib10<-Calibration_df(data=rs_train,predRisk = "eth_PRS_prob10",times=9,groups = 5,format = "wide")
+
+ggplot(enh_PRS_calib10, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  scale_x_continuous(limits = c(0,0.3)) +
+  scale_y_continuous(limits=c(0,0.3)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+```
+
+# Leicester score (Test)
+
+```{r pred prob test data}
+
+tot_test<-tot_test%>%select(!starts_with("RS_"))
+
+# Leicester risk score vars
+columns=c("TEU_BaC_AgeCat","BaC_Sex","Ethnicity","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+rs_test<-cbind(tot_test, setNames(tot_test[columns], paste0("RS_", columns)))
+
+rs_test<-rs_test%>%
+  mutate_at(paste0("RS_",columns), ~var_to_beta(.))
+
+# Sum all the columns starting with RS_
+
+rs_test<-rs_test%>%
+  mutate(sum_beta=-3.430668+rowSums(select(.,starts_with("RS_"))))%>%
+  mutate(Leicrs_prob=exp(sum_beta)/(1+exp(sum_beta)))%>%
+  mutate(# Predicted 10-year risk score (RS)
+    eth_prob10=1-predictCox(Eth_model,times=10,newdata = tot_test)$survival,
+    eth_PRS_prob10=1-predictCox(PRS_model,times=10, newdata = tot_test)$survival)
+
+```
+
+```{r}
+
+rs_test<-rs_test%>%mutate(
+    pred_groups=Percentile(Leicrs_prob,probs=seq(0, 1, 1/5),labels = c(1:5),right=TRUE))
+  
+survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_groups, data = rs_test) %>% 
+  ggsurvfit() +
+  labs(
+    title = "KM plot by quintiles of predicted probability from the Leicester model \n using the test data",
+    x = "Years",
+    y = "Overall survival probability"
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+
+```
+
+Title: Calibration plot of the Leicester score with 10-year risk of T2D using the test data.
+
+```{r Leicprob calibration test}
+
+Leic10_cal<-Calibration_df(data=rs_test,predRisk="Leicrs_prob",groups=5,times=9,format="wide")
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+ggplot(Leic10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  scale_x_continuous(limits = c(0,0.3)) +
+  scale_y_continuous(limits=c(0,0.3)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+# Enhanced score without PRS (Test)
+
+Title: Calibration plot of the enhanced score (without PRS) with 10-year risk of T2D using the test data.
+
+```{r}
+
+enh_calib10<-Calibration_df(predRisk = "eth_prob10",data=rs_test,groups=5,times=9,format="wide")
+
+ggplot(enh_calib10, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  scale_x_continuous(limits = c(0,0.3)) +
+  scale_y_continuous(limits=c(0,0.3)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+```
+
+# Enhanced score with PRS (Test)
+
+```{r}
+
+predRisk = "eth_PRS_prob10";times=10;groups = 5
+
+rs_test<-rs_test%>%mutate(
+     pred_deciles=Percentile((!!sym(predRisk)),probs=seq(0, 1, 1/groups),labels = c(1:groups),right=TRUE))
+
+survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_deciles, data = rs_test) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years",
+    y = "Overall survival probability"
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+
+```
+Title: Calibration plot of the enhanced score (with PRS) with 10-year risk of T2D using the test data
+
+```{r}
+
+enh_PRS_calib10<-Calibration_df(data=rs_test,predRisk = "eth_PRS_prob10",times=9,groups = 5,format = "wide")
+
+ggplot(enh_PRS_calib10, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  scale_x_continuous(limits = c(0,0.3)) +
+  scale_y_continuous(limits=c(0,0.3)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+```
+
+
+# OLD 
+
+We assessed the calibration of Leicester score, two enhanced scores using the training data. 
+
+The original Leicester score is not in the probability scale, but the [diabetes website](https://riskscore.diabetes.org.uk/start) provides the predicted probability of developing T2D within 10 years for each risk group (copied below):
+
+*	Low 0-6 risk category: 1 in 100 people with your risk will get T2D in the next 10 years. (p=0.01)
+*	Increased 7-15: 1 in 35. (p=0.03)
+* Moderate: 16-24: 1 in 10. (p=0.1)
+* High 25-47: 1 in 4. (p=0.25)
+
+We used the probabilities above as the predicted probability (plotted in blue dots) and computed the cumulative incidence via 1- Kaplan Meier estimate as the observed probability (plotted in red dots).
+
+
+```{r webpage,eval=FALSE}
+
+rs_train<-rs_train%>%mutate(group=as.numeric(diab_rs_cat))
+  
+# Predicted risk
+pred<-tibble(group=1:4,
+             value=case_when(group==1 ~ 1/100,
+                           group==2 ~ 1/35,
+                           group==3 ~ 1/10,
+                           group==4 ~ 1/4),
+           variable="Pred")
+
+
+# Observed onset risk in each risk group
+fit<-survfit(Surv(TEU_T2DM_time,TEU_T2DM_status)~group,data=rs_train)
+#res.sum <- surv_summary(fit)
+
+sum10<-summary(fit,times = 10)
+
+sum10_df <- data.frame(group=sum10$strata,
+                  surv = sum10$surv
+                  )
+
+obs<-sum10_df%>%
+  mutate(group=as.numeric(str_remove(group,"group=")),
+         value=1-surv,
+           variable="Obs")%>%
+  select(group,variable,value)
+  
+# Combine
+pred_obs<-rbind(pred,obs)# %>%
+    #group_by(group, variable) %>%
+    #summarise(value = mean(value), .groups='drop')%>%
+  #mutate(group=as.numeric(group),variable=as.factor(variable))
+  
+#Plot observed vs predicted 
+ggplot(pred_obs, aes(group, value, colour = variable)) + 
+                  geom_point(size = 3, shape=19) + 
+                  labs(title = "Calibration of the Leicester score at ten years using the training data.", x = "Risk group", y = "10-year T2D risk") +
+                  scale_color_manual(labels = c("Pred"="Predicted risk from Leicester score", "Obs"="Observed risk"), 
+                                     values = c("Pred"="blue", "Obs"="red")) + 
+                  theme(legend.title = element_blank()) + 
+                  scale_x_continuous(breaks = c(1, 2, 3, 4),
+                                     labels = c("Low:0-6", "Increased:7-15", "Moderate:16-24", "High:25-47")) 
+
+```
+
+
+We then produced the calibration plots for the two enhanced scores. The differences here were that we computed the predicted 10-year T2D probability for each participant using the Cox models and took the mean within each risk group (plotted in blue). The observed risk followed the same approach as above.
+
+```{r,eval=FALSE}
+
+# Model 1: Ethnicity + other Leicester vars
+
+RFs=c("TEU_BaC_AgeCat","BaC_Sex","TEU_ethnicgrp","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+formula<-as.formula(paste0("Surv(TEU_T2DM_time,TEU_T2DM_status)~",
+                           paste(RFs, collapse="+")))
+
+
+Eth_model<-coxph(formula,data = tot_train,x=TRUE)
+
+# Create list of betas 
+Eth_model_betas<-Eth_model$coefficients
+
+Eth_model_betas<-data.frame(round(Eth_model_betas*10,0))
+
+Eth_model_betas <- tibble::rownames_to_column(Eth_model_betas, "VALUE")
+colnames(Eth_model_betas)<-c("VALUE","New Score 1")
+
+# Present our model 
+Eth_model_output<-printcoxresults(df=tot_train,varlist=RFs,modeloutput = Eth_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE)
+
+```
+
+```{r,eval=FALSE}
+
+# Fit a model
+vars=c(RFs,"PRS_quintiles","GeP_Array")
+
+formula<-as.formula(paste0("Surv(TEU_T2DM_time,TEU_T2DM_status)~",
+                           paste(vars, collapse="+")))
+
+
+PRS_model<-coxph(formula,data = tot_train,x=TRUE)
+
+```
+
+```{r present Eth and PRS model,eval=FALSE}
+
+#Create list of new betas
+PRS_model_betas<-PRS_model$coefficients
+
+# multiply all betas by 10 and round to the nearest integer
+PRS_model_betas<-data.frame(round(PRS_model_betas*10,0))
+
+PRS_model_betas <- tibble::rownames_to_column(PRS_model_betas, "VALUE")
+colnames(PRS_model_betas)<-c("VALUE","New Score 2")
+
+
+# Present the model 
+PRS_model_output<-printcoxresults(df=tot_train,varlist=c(RFs,"PRS_quintiles"),modeloutput = PRS_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE)
+
+# Processing 
+model_output<-Eth_model_output%>%
+  # add new score 1 
+  left_join(.,Eth_model_betas,by=c("IDcol"="VALUE"))%>%
+  mutate(`New Score 1`=replace_na(`New Score 1`,0))%>%
+  # Full join the PRS model
+  full_join(.,PRS_model_output,by="IDcol")%>%
+  # Add new score 2
+  left_join(.,PRS_model_betas,by=c("IDcol"="VALUE"))%>%
+  mutate(`New Score 2`=replace_na(`New Score 2`,0))%>%
+  select(Coefficient.y,Levels.y,Beta.x,`95% CI.x`,p.x,`New Score 1`,Beta.y,`95% CI.y`,`p.y`,`New Score 2`)
+
+
+# Eth model
+Eth_betas_list<-setNames(na.omit(model_output$`New Score 1`),model_output%>%filter(!is.na(`New Score 1`))%>%pull(Levels.y))
+
+# new betas list
+PRS_betas_list <- setNames(model_output$`New Score 2`,model_output$Levels.y)
+
+```
+
+```{r compute new risk scores training,eval=FALSE}
+
+# Prep for computing risk scores
+columns=c("TEU_BaC_AgeCat","BaC_Sex","TEU_ethnicgrp","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+columns_PRS=c(columns,"PRS_quintiles")
+
+# Make duplicate columns for variables to be transferred to corresponding scores
+
+rs_train<-cbind(tot_train,
+                setNames(tot_train[columns], paste0("Eth_", columns)),
+                setNames(tot_train[columns_PRS], paste0("NRSPRS_", columns_PRS)))
+
+# 2. Compute the risk score
+#https://dplyr.tidyverse.org/reference/recode.html#ref-usage
+rs_train<-rs_train%>%
+  # Compute enhanced risk score 1
+  mutate_at(paste0("Eth_",columns), ~recode(.,!!!Eth_betas_list))%>%
+  mutate(Eth_rs=rowSums(select(.,starts_with("Eth_"))))%>%
+  # Compute enhanced risk score 2
+  # Essential to add .default=0 because the beta list doesn't have all possible levels (e.g. 40-49 Yes high BP)
+  mutate_at(paste0("NRSPRS_",columns_PRS), ~recode(.,!!!PRS_betas_list,.default = 0))%>%
+  mutate(PRS_rs=rowSums(select(.,starts_with("NRSPRS_"))))%>%
+  # create status at 10 years
+  mutate(T2D10_status=ifelse(TEU_T2DM_status==1 & TEU_T2DM_time<=10,1,0))
+
+```
+
+```{r compute new risk scores test,eval=FALSE}
+
+# Make duplicate columns for variables to be transferred to corresponding scores
+
+rs_test<-cbind(tot_test,
+               setNames(tot_test[columns], paste0("Eth_", columns)),
+               setNames(tot_test[columns_PRS], paste0("NRSPRS_", columns_PRS)))
+
+# 2. Compute the risk score using age int scoring
+#https://dplyr.tidyverse.org/reference/recode.html#ref-usage
+rs_test<-rs_test%>%
+  # Compute enhanced risk score 1
+  mutate_at(paste0("Eth_",columns), ~recode(.,!!!Eth_betas_list))%>%
+  mutate(Eth_rs=rowSums(select(.,starts_with("Eth_"))))%>%
+  # Compute enhanced risk score 2
+  # Essential to add .default=0 because the beta list doesn't have all possible levels (e.g. 40-49 Yes high BP)
+  mutate_at(paste0("NRSPRS_",columns_PRS), ~recode(.,!!!PRS_betas_list,.default = 0))%>%
+  mutate(PRS_rs=rowSums(select(.,starts_with("NRSPRS_"))))%>%
+  # create status at 10 years
+  mutate(T2D10_status=ifelse(TEU_T2DM_status==1 & TEU_T2DM_time<=10,1,0))
+
+```
+
+```{r optimal cutoffs,eval=FALSE}
+
+# 60% seems a good fit
+Leicrs16_perc=pretty_dp(rs_train%>%filter(diab_rs<16)%>%nrow()/nrow(rs_train),pct=TRUE,dp=0)
+
+Eth_threshold=quantile(rs_train$Eth_rs,as.numeric(Leicrs16_perc)/100)
+
+PRS_threshold=quantile(rs_train$PRS_rs,as.numeric(Leicrs16_perc)/100) 
+
+```
+
+
+```{r compute 10-year risk of enhanced models,eval=FALSE}
+# Categorise individuals into low and high risk based on enhanced scores
+rs_train$Eth_rs_binary<-ifelse(rs_train$Eth_rs<Eth_threshold,1,2)
+rs_train$PRS_rs_binary<-ifelse(rs_train$PRS_rs<PRS_threshold,1,2)
+
+# Compute the predicted probability
+rs_train<-rs_train%>%
+  mutate(# Predicted 10-year risk score (RS)
+    eth_rs=1-predictCox(Eth_model,times=10,newdata = rs_train)$survival,
+    eth_PRS_rs=1-predictCox(PRS_model,times=10, newdata = rs_train)$survival)
+
+pred<-rs_train%>%
+  group_by(Eth_rs_binary)%>%
+  summarise(value=mean(eth_rs))%>%
+  mutate(variable="Pred")%>%rename(group=Eth_rs_binary)
+
+# Observed onset risk in each risk group
+fit<-survfit(Surv(TEU_T2DM_time,TEU_T2DM_status)~Eth_rs_binary,data=rs_train)
+#res.sum <- surv_summary(fit)
+
+sum10<-summary(fit,times = 10)
+
+sum10_df <- data.frame(group=sum10$strata,
+                  surv = sum10$surv
+                  )
+
+obs<-sum10_df%>%
+  mutate(group=as.numeric(str_remove(group,"Eth_rs_binary=")),
+         value=1-surv,
+           variable="Obs")%>%
+  select(group,variable,value)
+  
+# Combine
+pred_obs<-rbind(pred,obs)# %>%
+    #group_by(group, variable) %>%
+    #summarise(value = mean(value), .groups='drop')%>%
+  #mutate(group=as.numeric(group),variable=as.factor(variable))
+  
+#Plot observed vs predicted 
+ggplot(pred_obs, aes(group, value, colour = variable)) + 
+                  geom_point(size = 3, shape=19) + 
+                  labs(title = "Calibration of the enhanced score (without PRS) at ten years using the training data.", x = "Risk group", y = "10-year T2D risk") +
+                  scale_color_manual(labels = c("Pred"="Predicted risk from enhanced score (without PRS)", "Obs"="Observed risk"), 
+                                     values = c("Pred"="blue", "Obs"="red")) + 
+                  theme(legend.title = element_blank()) + 
+                  scale_x_continuous(breaks = c(1, 2),
+                                     labels = c("Low:0-18", "High:19-59")) 
+```
+
+```{r,eval=FALSE}
+
+pred<-rs_train%>%
+  group_by(PRS_rs_binary)%>%
+  summarise(value=mean(eth_PRS_rs))%>%
+  mutate(variable="Pred")%>%rename(group=PRS_rs_binary)
+
+# Observed onset risk in each risk group
+fit<-survfit(Surv(TEU_T2DM_time,TEU_T2DM_status)~PRS_rs_binary,data=rs_train)
+#res.sum <- surv_summary(fit)
+
+sum10<-summary(fit,times = 10)
+
+sum10_df <- data.frame(group=sum10$strata,
+                  surv = sum10$surv
+                  )
+
+obs<-sum10_df%>%
+  mutate(group=as.numeric(str_remove(group,"PRS_rs_binary=")),
+         value=1-surv,
+           variable="Obs")%>%
+  select(group,variable,value)
+  
+# Combine
+pred_obs<-rbind(pred,obs)# %>%
+    #group_by(group, variable) %>%
+    #summarise(value = mean(value), .groups='drop')%>%
+  #mutate(group=as.numeric(group),variable=as.factor(variable))
+  
+#Plot observed vs predicted 
+ggplot(pred_obs, aes(group, value, colour = variable)) + 
+                  geom_point(size = 3, shape=19) + 
+                  labs(title = "Calibration of the enhanced score (with PRS) at ten years using the training data.", x = "Risk group", y = "10-year T2D risk") +
+                  scale_color_manual(labels = c("Pred"="Predicted risk from enhanced score (with PRS)", "Obs"="Observed risk"), 
+                                     values = c("Pred"="blue", "Obs"="red")) + 
+                  theme(legend.title = element_blank()) + 
+                  scale_x_continuous(breaks = c(1, 2),
+                                     labels = c("Low:0-27", "High:28-73")) 
+```
+
+
+# Calibration using test data
+
+We followed the same steps as above but with test data instead.
+
+```{r,eval=FALSE}
+
+rs_test<-rs_test%>%mutate(group=as.numeric(diab_rs_cat))
+  
+# Predicted risk
+pred<-tibble(group=1:4,
+             value=case_when(group==1 ~ 1/100,
+                           group==2 ~ 1/35,
+                           group==3 ~ 1/10,
+                           group==4 ~ 1/4),
+           variable="Pred")
+
+
+# Observed onset risk in each risk group
+fit<-survfit(Surv(TEU_T2DM_time,TEU_T2DM_status)~group,data=rs_test)
+#res.sum <- surv_summary(fit)
+
+sum10<-summary(fit,times = 10)
+
+sum10_df <- data.frame(group=sum10$strata,
+                  surv = sum10$surv
+                  )
+
+obs<-sum10_df%>%
+  mutate(group=as.numeric(str_remove(group,"group=")),
+         value=1-surv,
+           variable="Obs")%>%
+  select(group,variable,value)
+  
+# Combine
+pred_obs<-rbind(pred,obs)# %>%
+    #group_by(group, variable) %>%
+    #summarise(value = mean(value), .groups='drop')%>%
+  #mutate(group=as.numeric(group),variable=as.factor(variable))
+  
+#Plot observed vs predicted 
+ggplot(pred_obs, aes(group, value, colour = variable)) + 
+                  geom_point(size = 3, shape=19) + 
+                  labs(title = "Calibration of the Leicester score at ten years using the test data.", x = "Risk group", y = "10-year T2D risk") +
+                  scale_color_manual(labels = c("Pred"="Predicted risk from Leicester score", "Obs"="Observed risk"), 
+                                     values = c("Pred"="blue", "Obs"="red")) + 
+                  theme(legend.title = element_blank()) + 
+                  scale_x_continuous(breaks = c(1, 2, 3, 4),
+                                     labels = c("Low:0-6", "Increased:7-15", "Moderate:16-24", "High:25-47")) 
+
+```
+
+```{r,eval=FALSE}
+# Categorise individuals into low and high risk based on enhanced scores
+rs_test$Eth_rs_binary<-ifelse(rs_test$Eth_rs<Eth_threshold,1,2)
+rs_test$PRS_rs_binary<-ifelse(rs_test$PRS_rs<PRS_threshold,1,2)
+
+# Compute the predicted probability
+rs_test<-rs_test%>%
+  mutate(# Predicted 10-year risk score (RS)
+    eth_rs=1-predictCox(Eth_model,times=10,newdata = rs_test)$survival,
+    eth_PRS_rs=1-predictCox(PRS_model,times=10, newdata = rs_test)$survival)
+
+pred<-rs_test%>%
+  group_by(Eth_rs_binary)%>%
+  summarise(value=mean(eth_rs))%>%
+  mutate(variable="Pred")%>%rename(group=Eth_rs_binary)
+
+# Observed onset risk in each risk group
+fit<-survfit(Surv(TEU_T2DM_time,TEU_T2DM_status)~Eth_rs_binary,data=rs_test)
+#res.sum <- surv_summary(fit)
+
+sum10<-summary(fit,times = 10)
+
+sum10_df <- data.frame(group=sum10$strata,
+                  surv = sum10$surv
+                  )
+
+obs<-sum10_df%>%
+  mutate(group=as.numeric(str_remove(group,"Eth_rs_binary=")),
+         value=1-surv,
+           variable="Obs")%>%
+  select(group,variable,value)
+  
+# Combine
+pred_obs<-rbind(pred,obs)# %>%
+    #group_by(group, variable) %>%
+    #summarise(value = mean(value), .groups='drop')%>%
+  #mutate(group=as.numeric(group),variable=as.factor(variable))
+  
+#Plot observed vs predicted 
+ggplot(pred_obs, aes(group, value, colour = variable)) + 
+                  geom_point(size = 3, shape=19) + 
+                  labs(title = "Calibration of the enhanced score (without PRS) at ten years using the test data.", x = "Risk group", y = "10-year T2D risk") +
+                  scale_color_manual(labels = c("Pred"="Predicted risk from enhanced score (without PRS)", "Obs"="Observed risk"), 
+                                     values = c("Pred"="blue", "Obs"="red")) + 
+                  theme(legend.title = element_blank()) + 
+                  scale_x_continuous(breaks = c(1, 2),
+                                     labels = c("Low:0-18", "High:19-59"))
+```
+
+```{r,eval=FALSE}
+
+pred<-rs_test%>%
+  group_by(PRS_rs_binary)%>%
+  summarise(value=mean(eth_PRS_rs))%>%
+  mutate(variable="Pred")%>%rename(group=PRS_rs_binary)
+
+# Observed onset risk in each risk group
+fit<-survfit(Surv(TEU_T2DM_time,TEU_T2DM_status)~PRS_rs_binary,data=rs_test)
+#res.sum <- surv_summary(fit)
+
+sum10<-summary(fit,times = 10)
+
+sum10_df <- data.frame(group=sum10$strata,
+                  surv = sum10$surv
+                  )
+
+obs<-sum10_df%>%
+  mutate(group=as.numeric(str_remove(group,"PRS_rs_binary=")),
+         value=1-surv,
+           variable="Obs")%>%
+  select(group,variable,value)
+  
+# Combine
+pred_obs<-rbind(pred,obs)# %>%
+    #group_by(group, variable) %>%
+    #summarise(value = mean(value), .groups='drop')%>%
+  #mutate(group=as.numeric(group),variable=as.factor(variable))
+  
+#Plot observed vs predicted 
+ggplot(pred_obs, aes(group, value, colour = variable)) + 
+                  geom_point(size = 3, shape=19) + 
+                  labs(title = "Calibration of the enhanced score (with PRS) at ten years using the test data.", x = "Risk group", y = "10-year T2D risk") +
+                  scale_color_manual(labels = c("Pred"="Predicted risk from enhanced score (with PRS)", "Obs"="Observed risk"), 
+                                     values = c("Pred"="blue", "Obs"="red")) + 
+                  theme(legend.title = element_blank()) + 
+                  scale_x_continuous(breaks = c(1, 2),
+                                     labels = c("Low:0-27", "High:28-73")) 
+```
+
+
+
+
+
+
+
+
+
+
+

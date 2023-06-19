@@ -1,0 +1,241 @@
+---
+title: "Prepare data for the Leicester risk score analysis"
+author: "Xiaonan Liu"
+date: '2022-11-02'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(yaml)
+library(here)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(dplyr)
+library(Rcpp)
+library(etm)
+library(readr)
+library(tibble)
+library(Publish)
+library(rsample)
+
+# Specify the markdown format for knitr tables, otherwise they're not compatible with kableExtra
+#options(knitr.kable.NA='', knitr.table.format = "html")
+#options(kableExtra.auto_format = FALSE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions))
+
+```
+
+
+```{r derive-data,eval=FALSE,include=FALSE}
+
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+exclusions <- function(data) {
+  
+  excl$initial <<- nrow(data)
+  
+  ## General
+  # Array as proxy for genetic data availability
+  data<-data%>%filter(!is.na(GeP_Array))
+  excl$genetic <<- nrow(data)
+
+  # T2D PRS (Genomics PLC std)
+  data <- data[!is.na(data$GPLC_std_T2DM_PRS),]
+  excl$corecomp<<-nrow(data)
+
+  # White British
+  #data<-data%>%filter(!is.na(GeP_ethnic))
+  #excl$white<<-nrow(data)
+
+  # Age
+  data<-data%>%filter(!(!is.na(TEU_BaC_AgeAtRec) & TEU_BaC_AgeAtRec<40 | TEU_BaC_AgeAtRec>=70))
+  excl$agewithin<<-nrow(data)
+  
+  # Exclude ppl without GP data
+  data<-data%>%filter(!is.na(TEU_PC_ind) & TEU_T2DM_time>0)
+  excl$GP<<-nrow(data)
+  
+  ## Complete core vars
+  
+  # Exclude missing Waist circum
+  data<-data%>%filter(!is.na(BSM_WaistCirc))
+  excl$WaistC<<-nrow(data)
+  
+  # Exclude missing BMI
+  data<-data%>%filter(!is.na(TEU_BSM_BMIcat))
+  excl$BMI<<-nrow(data)
+  
+  # Exclude missing self-reported ethnicity 
+  data<-data%>%filter(!is.na(TEU_ethnicgrp))
+  excl$compcore<<-nrow(data)
+  
+  ## Exclude prevalent diab (Eastwood2016 + HES)
+  data <- data[data$TEU_diab_excl%in%c("Diabetes unlikely","Possible gestational diabetes"),]
+  excl$nodiab <<- nrow(data)
+  
+  # Exclude extra prevalent diab based on GP data (clinical and scripts)
+  data <- data%>%filter(TEU_PC_diab_prev==0 & TEU_PCmeds_diab_prev==0)
+  excl$nodiab_GP <<- nrow(data)
+  
+  return(data)
+}
+
+excl <- list(initial=0)
+
+data <-
+  #evalWithMemoization(
+    derive_variables(
+      database = config$data$database,
+      field_definitions = TEU_SPECS$T2DM_PRS,
+      exclusions = exclusions
+    #),
+    #key = c(TEU_SPECS$BrCa_PRS, exclusions)
+  )
+
+pretty_func <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type = "function")
+pretty_names <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type="list")
+
+
+backup<-data
+
+saveRDS(data,file.path(config$data$derived,"data.rds"))
+```
+
+
+```{r analysis FC,eval=FALSE}
+# Analysis FC
+label1 <- paste0('UKB participants\\nn = ', excl$initial)
+label2 <- paste0('Unrelated multiethinic participants with','\\n','good quality genotyping data, aged between 40 and 70,\\n',' GP data available\\n','n = ', excl$GP)
+label3 <- paste0('Complete information on core variables\\nn = ', excl$compcore)
+label4 <- paste0('Study population: No history of type 1 or type 2 diabetes at baseline\\nn = ',excl$nodiab_GP)
+
+label5 <- paste0(excl$ini-excl$genetic, ' missing genotyping data\\l', excl$genetic-excl$corecomp, ' missing PRS\\l',excl$corecomp-excl$agewithin,' outside the age range of [40,70) years\\l', excl$agewithin-excl$GP, ' no GP data available\\l')
+
+label6 <-paste0(excl$GP-excl$WaistC,' missing waist circumference at baseline \\l',excl$WaistC-excl$BMI,' missing BMI at baseline\\l',excl$BMI-excl$compcore,' missing self-reported ethnicity at baseline\\l','')
+
+label7 <- paste0(excl$compcore-excl$nodiab_GP, ' type 1 or type 2 diabetes at baseline\\l','')
+
+gv <- read_file(file.path(config$outputs$flowcharts, "Diabetes_PRS.gv"))
+
+export_svg(DiagrammeR::grViz(glue(gv))
+) %>% charToRaw %>%rsvg%>%
+  #rsvg(width = 638, height = 410) %>%
+  png::writePNG(file.path(config$outputs$figures, "PRSLeicester_excl.png"))
+
+```
+
+
+```{r derive vars,eval=FALSE}
+
+# Derive variables according to groupings in the risk score 
+
+data<-data%>%
+  mutate(
+    # Waist circumference
+    BSM_WaistCirc_Cat=factor(cut(BSM_WaistCirc, breaks = c(0,90,100,110,200), right = FALSE),levels = c("[0,90)", "[90,100)", "[100,110)", "[110,200)"),labels = c("<90", "90-99", "100-109", ">=110")),
+    # BMI 
+    BSM_BMI_Cat=factor(cut(BSM_BMI, breaks = c(0,25,30,35,200), right = FALSE),levels = c("[0,25)", "[25,30)", "[30,35)", "[35,200)"),labels = c("<25", "25-29", "30-34", ">=35")),
+    # high BP (including meds)
+    HighBP=factor(ifelse(TEU_HMH_Meds_BP=="Self-reported BP meds" | TEU_HMH_prevHTN=="Self-reported hypertension",1,0),levels = c(0,1),labels = c("No","Yes")),
+    # Ethnicity 
+    Ethnicity=factor(ifelse(TEU_ethnicgrp=="White",0,1),levels=c(0,1),labels=c("White","Other"))
+  )
+
+# Need to make sure the reference level of variables are the same as Leicester!
+# I think Leicester treated "Female" as the reference group for Sex, even though Table 2 says differently
+#data<-data%>%
+ # mutate(BaC_Sex=relevel(BaC_Sex,"Male"))
+```
+
+```{r derive Leicester score,eval=FALSE}
+
+# Derive Leicester score
+
+# No age in 70-75 or people with other ethnic group
+
+# Leicester risk score vars
+columns=c("TEU_BaC_AgeCat","BaC_Sex","Ethnicity","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+rs_data<-cbind(data, setNames(data[columns], paste0("RS_", columns)))
+
+rs_data<-rs_data%>%
+  mutate_at(paste0("RS_",columns), ~var_to_score(.))
+
+#rs_data%>%select(TEU_BaC_AgeCat,RS_TEU_BaC_AgeCat)%>%head
+
+rs_data%>%select(starts_with("RS_"))%>%anyNA()
+
+# Sum all the columns starting with RS_
+
+rs_data<-rs_data%>%
+  mutate(diab_rs=rowSums(select(.,starts_with("RS_"))))%>%
+  # Categorise risk score according to threshold
+  mutate(diab_rs_cat=factor(cut(diab_rs, breaks = c(0,7,16,25,48), right = FALSE),levels = c("[0,7)", "[7,16)", "[16,25)", "[25,48)"),labels = c("Low:0-6", "Increased:7-15", "Moderate:16-24", "High:25-47")))
+
+saveRDS(rs_data,file.path(config$data$derived,"data_Leicrs.rds"))
+```
+
+
+# Train-test split
+
+```{r train-test split,eval=FALSE}
+
+# Use set.seed for reproducibility
+
+set.seed(123)
+split <- initial_split(rs_data, prop = .8)
+tot_train <- training(split)
+tot_test  <- testing(split)
+
+```
+
+```{r PRS quintiles,eval=FALSE}
+# Derive PRS quintiles using training data only. 
+quant=5
+quantiles <- quantile(tot_train$GPLC_std_T2DM_PRS, probs=seq(0, 1, 1/quant), na.rm=TRUE)
+
+labels <- c("Q1: lowest", paste0("Q", seq(2, quant-1)), paste0("Q", quant, ": highest"))
+
+tot_train$PRS_quintiles <- cut(tot_train$GPLC_std_T2DM_PRS, breaks=quantiles, labels=labels, right=TRUE, include.lowest=TRUE)
+    
+
+# Then assign PRS in test data into quintiles based on cut-offs computed from training data
+# If a person's PRS < min, assign as Q1; if PRS>max, assign Q5.
+tot_test$PRS_quintiles <- cut(tot_test$GPLC_std_T2DM_PRS,breaks=c(-Inf,quantiles[c(2,3,4,5)],Inf),labels=labels,right=TRUE,include.lowest=TRUE)
+
+```
+
+```{r save data,eval=FALSE}
+
+saveRDS(tot_train,file = file.path(config$data$derived,"tot_train.rds"))
+saveRDS(tot_test,file = file.path(config$data$derived,"tot_test.rds"))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

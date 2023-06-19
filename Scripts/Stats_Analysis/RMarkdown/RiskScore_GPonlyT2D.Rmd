@@ -1,0 +1,740 @@
+---
+title: 'Leicester SA: Using GP only for outcome ascertainment'
+author: "Xiaonan Liu"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  word_document:
+      fig_width: 8
+      fig_height: 5
+      reference_docx: "K:/TEU/TEU_Guides/TEU_DocStyle_Rmd_2020.dotx"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(dplyr)
+library(survival)
+library(survminer)
+library(Rcpp)
+library(summarytools)
+library(arsenal)
+library(pander)
+library(ggeffects)
+library(sjPlot)
+library(etm)
+library(readr)
+library(tibble)
+library(ResourceSelection)
+library(Publish)
+library(rsample)
+library(plotROC)
+library(pROC)
+library(nricens)
+library(PredictABEL)
+library(cutpointr)
+library(caret)
+library(gridExtra)
+# Specify the markdown format for knitr tables, otherwise they're not compatible with kableExtra
+#options(knitr.kable.NA='', knitr.table.format = "html")
+#options(kableExtra.auto_format = FALSE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions))
+source(here::here(config$scripts$nri))
+
+my_controls <- tableby.control(
+    test = F,
+    total = T,
+    #numeric.test = "kwt", cat.test = "chisq",
+    numeric.stats = c("meansd", "medianq1q3", "range", "Nmiss"), 
+    cat.stats = c("countpct", "Nmiss"),
+    stats.labels = list(
+      meansd = "Mean (SD)",
+      medianq1q3 = "Median (IQR)",
+      range = "Min - Max",
+      Nmiss = "Missing",
+      Npct="N (Pct)"
+    ),
+    digits = 2L
+  )
+
+# Read in data derived from code chunk below
+data<-readRDS(here::here(file.path(config$data$derived,"data_Leicrs.RDS")))
+
+tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
+tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
+
+
+```
+
+```{r,include=FALSE}
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+pretty_func <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type = "function")
+pretty_names <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type="list")
+
+pretty_names$BaC_Sex="Sex"
+pretty_names$hba1c_cat="HbA1c at baseline"
+pretty_names$hba1c_cat2="HbA1c at baseline"
+
+pretty_names$BSM_WaistCirc_Cat="Waist circumference,cm"
+pretty_names$BSM_BMI_Cat="BMI"
+pretty_names$HighBP="Antihypertensive meds or high blood pressure"
+pretty_names$diab_rs_cat="Leicester risk score"
+pretty_names$PRS_quintiles="T2D PRS quintiles"
+pretty_names$Ethnicity="Ethnicity"
+
+pretty_names$diab_rs="LRA Score"
+pretty_names$Eth_rs="LRArev Score"
+pretty_names$PRS_rs="LRAprs Score"
+```
+
+In this sensitivity analysis, we derive incident type 2 diabetes using GP diagnosis only. The censoring date is the minimum of the following:
+
+*	Death date (regardless of whether T2D is listed as a cause of death)
+*	GP censoring
+*	Loss to follow-up
+*	Deduction date.
+
+The only difference of this censoring approach from the main analysis is that in main analysis, we count people who died from T2D as incident T2D cases but in SA, we censor them.
+
+```{r re-derive T2D}
+
+# Derive training and test separately
+tot_train<-tot_train%>%
+  # create death date (regardless of T2D)
+  mutate(Dth_date=coalesce(TEU_Dth_T2DM_dthdate,TEU_Dth_NotT2DM_dthdate),
+         SA_T2DM_censordate=pmin(Dth_date,Admin_CensorDate,BaC_LostFUDate,Admin_PC_CensorDate,na.rm = TRUE))%>%
+  # create GP only dx of T2D
+  mutate(SA_T2DM_status=case_when(
+          !is.na(TEU_PC_T2D_date) & TEU_PC_T2D_date<=SA_T2DM_censordate ~ 1,
+          is.na(TEU_PC_T2D_date) |(!is.na(TEU_PC_T2D_date)&TEU_PC_T2D_date>SA_T2DM_censordate) ~ 0),
+         SA_T2DM_time=case_when(
+          SA_T2DM_status==0 ~ as.numeric(difftime(SA_T2DM_censordate, Rec_DateAssess, unit='days'))/365.25,
+          SA_T2DM_status==1 ~ as.numeric(difftime(TEU_PC_T2D_date, Rec_DateAssess, unit='days'))/365.25))
+      
+  
+tot_test<-tot_test%>%
+  # create death date (regardless of T2D)
+  mutate(Dth_date=coalesce(TEU_Dth_T2DM_dthdate,TEU_Dth_NotT2DM_dthdate),
+         SA_T2DM_censordate=pmin(Dth_date,Admin_CensorDate,BaC_LostFUDate,Admin_PC_CensorDate,na.rm = TRUE))%>%
+  # create GP only dx of T2D
+  mutate(SA_T2DM_status=case_when(
+          !is.na(TEU_PC_T2D_date) & TEU_PC_T2D_date<=SA_T2DM_censordate ~ 1,
+          is.na(TEU_PC_T2D_date) |(!is.na(TEU_PC_T2D_date)&TEU_PC_T2D_date>SA_T2DM_censordate) ~ 0),
+         SA_T2DM_time=case_when(
+          SA_T2DM_status==0 ~ as.numeric(difftime(SA_T2DM_censordate, Rec_DateAssess, unit='days'))/365.25,
+          SA_T2DM_status==1 ~ as.numeric(difftime(TEU_PC_T2D_date, Rec_DateAssess, unit='days'))/365.25))
+
+```
+
+# Descriptive statistics
+
+In training data (N=`r nrow(tot_train)`), `r sum(tot_train$SA_T2DM_status)` (`r pretty_dp(sum(tot_train$SA_T2DM_status)/nrow(tot_train),dp=1,pct=TRUE)`%) developed T2D cases at follow up (median follow-up is `r pretty_dp(median(tot_train$SA_T2DM_time),1)` years). There were `r tot_train%>%filter(SA_T2DM_time>10)%>%nrow()` had follow-up time exceeding 10 years, among which there were `r tot_train%>%filter(SA_T2DM_time>10)%>%pull(SA_T2DM_status)%>%sum()` cases.
+
+In test data (N=`r nrow(tot_test)`), `r sum(tot_test$SA_T2DM_status)` (`r pretty_dp(sum(tot_test$SA_T2DM_status)/nrow(tot_test),dp=1,pct=TRUE)`%) developed T2D cases at follow up (median follow-up is `r pretty_dp(median(tot_test$SA_T2DM_time),1)` years). There were `r tot_test%>%filter(SA_T2DM_time>10)%>%nrow()` had follow-up time exceeding 10 years, among which there were `r tot_test%>%filter(SA_T2DM_time>10)%>%pull(SA_T2DM_status)%>%sum()` cases.
+
+
+
+# Analyses
+
+In summary, we followed the steps below: 
+
+* Build two separate models:
+
+  - The enhanced model without PRS
+  - The enhanced model with PRS
+
+* Calculate three sets of risk scores for individuals: the original Leicester score, the enhanced score without PRS, the enhanced score with PRS.
+
+* Compare model performance among all three risk scores with onset T2D.
+
+
+## Model building 
+
+Note: We only computed the Leicester score for the study population using their published scoring system. We did NOT build a separate model fitting the original Leicester variables. 
+
+We built two separate models: 
+
+**Model 1: The enhanced model without PRS**:
+
+A Cox model: Incident T2D ~ Age + Sex + Ethnicity (more refined groupings)* + FaH of diab + Waist circumference + BMI + High BP
+
+Note*: The more refined groupings of ethnicity are White (ref), Black, South Asian, Mixed, Other. The ethnicity variable in the original Leicester score is binary with the groupings: White (ref) and Other.
+
+```{r Build the enhanced model 1}
+# Model 1: Ethnicity + other Leicester vars
+
+RFs=c("TEU_BaC_AgeCat","BaC_Sex","TEU_ethnicgrp","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+formula<-as.formula(paste0("Surv(SA_T2DM_time,SA_T2DM_status)~",
+                           paste(RFs, collapse="+")))
+
+
+Eth_model<-coxph(formula,data = tot_train)
+
+# Create list of betas 
+Eth_model_betas<-Eth_model$coefficients
+
+Eth_model_betas<-data.frame(round(Eth_model_betas*10,0))
+
+Eth_model_betas <- tibble::rownames_to_column(Eth_model_betas, "VALUE")
+colnames(Eth_model_betas)<-c("VALUE","New Score 1")
+
+# Present our model 
+Eth_model_output<-printcoxresults(df=tot_train,varlist=RFs,modeloutput = Eth_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE)
+
+# Processing 
+
+#Eth_model_output<-Eth_model_output%>%
+  # add Leicester risk score 
+  #mutate(`Leicester score`=var_to_score(Levels))%>%
+  # add new score 
+  #left_join(.,Eth_model_betas,by=c("IDcol"="VALUE"))%>%
+  #mutate(`New Score 1`=replace_na(`New Score 1`,0))
+
+#pander(Eth_model_output,caption = "The model output of the enhanced Leicester model, replacing the original binary ethnicity variable with a more refined ethnicity variable.")
+
+```
+
+**Model 2: The enhanced PRS model**: Further adding PRS (in quintiles) to the model 1 above:
+
+A Cox model: Incident T2D status ~ Age + Sex + Ethnicity (more refined groupings) + FaH of diab + Waist circumference + BMI + High BP + PRS (quintiles) + genetic array.
+
+Note: genetic array was included in the model only for adjustment. Its beta was not used to construct a risk score.
+
+
+```{r PRS model}
+
+# Fit a model
+vars=c(RFs,"PRS_quintiles","GeP_Array")
+
+formula<-as.formula(paste0("Surv(SA_T2DM_time,SA_T2DM_status)~",
+                           paste(vars, collapse="+")))
+
+
+PRS_model<-coxph(formula,data = tot_train)
+
+```
+
+[Add Leicester score chart]
+
+
+```{r present Eth and PRS model}
+
+#Create list of new betas
+PRS_model_betas<-PRS_model$coefficients
+
+# multiply all betas by 10 and round to the nearest integer
+PRS_model_betas<-data.frame(round(PRS_model_betas*10,0))
+
+PRS_model_betas <- tibble::rownames_to_column(PRS_model_betas, "VALUE")
+colnames(PRS_model_betas)<-c("VALUE","New Score 2")
+
+
+# Present the model 
+PRS_model_output<-printcoxresults(df=tot_train,varlist=c(RFs,"PRS_quintiles"),modeloutput = PRS_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE)
+
+# Processing 
+model_output<-Eth_model_output%>%
+  # add new score 1 
+  left_join(.,Eth_model_betas,by=c("IDcol"="VALUE"))%>%
+  mutate(`New Score 1`=replace_na(`New Score 1`,0))%>%
+  # Full join the PRS model
+  full_join(.,PRS_model_output,by="IDcol")%>%
+  # Add new score 2
+  left_join(.,PRS_model_betas,by=c("IDcol"="VALUE"))%>%
+  mutate(`New Score 2`=replace_na(`New Score 2`,0))%>%
+  select(Coefficient.y,Levels.y,Beta.x,`95% CI (Beta).x`,HR.x,`95% CI (HR).x`,p.x,`New Score 1`,Beta.y,`95% CI (Beta).y`,HR.y,`95% CI (HR).y`,`p.y`,`New Score 2`)
+
+
+# Eth model
+Eth_betas_list<-setNames(na.omit(model_output$`New Score 1`),model_output%>%filter(!is.na(`New Score 1`))%>%pull(Levels.y))
+
+# new betas list
+PRS_betas_list <- setNames(model_output$`New Score 2`,model_output$Levels.y)
+
+```
+
+```{r pretty present models}
+
+# for presenting only
+Eth_temp<-printcoxresults(df=tot_train,varlist=RFs,modeloutput = Eth_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE,onecol = TRUE)
+
+PRS_temp<-printcoxresults(df=tot_train,varlist=c(RFs,"PRS_quintiles"),modeloutput = PRS_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE,onecol = TRUE)
+
+# Processing 
+model_temp<-Eth_temp%>%
+  # add new score 1 
+  left_join(.,Eth_model_betas,by=c("IDcol"="VALUE"))%>%
+  # Full join the PRS model
+  full_join(.,PRS_temp,by="IDcol")%>%
+  # Add new score 2
+  left_join(.,PRS_model_betas,by=c("IDcol"="VALUE"))%>%
+  mutate(
+    `New Score 1`=ifelse(Beta.x=="Reference",0,`New Score 1`),
+    `New Score 2`=ifelse(Beta.y=="Reference",0,`New Score 2`))%>%
+  mutate_if(is.character, ~replace_na(.,""))%>%
+  mutate(Beta_CI.x=paste0(Beta.x," ",`95% CI (Beta).x`),
+         Beta_CI.y=paste0(Beta.y," ",`95% CI (Beta).y`),
+         HR_CI.x=paste0(HR.x," ",`95% CI (HR).x`),
+         HR_CI.y=paste0(HR.y," ",`95% CI (HR).y`))%>%
+  select(Coefficient.y,`Beta_CI.x`,`HR_CI.x`,p.x,`New Score 1`,`Beta_CI.y`,`HR_CI.y`,`p.y`,`New Score 2`)
+
+
+pander(model_temp,caption = "Model outputs and scoring system of the enhanced score without PRS model and with PRS model, derived using the training data. 'New score 1' was derived from the enhanced model without PRS and 'New score 2' was derived from the enhanced model with PRS. Both new scores were derived by multiplying the beta coefficients from the corresponding model by 10 and rounding up to the nearest integer.")
+
+```
+
+
+To compute the new risk score from the two enhanced models, we followed the same approach as the Leicester risk score: Multiply the beta coefficients from each model by 10 and round up to the nearest integer (See 'New Score 1' and 'New Score 2' above). These scores are then summed to give the total score.
+
+```{r compute new risk scores training}
+
+# Prep for computing risk scores
+columns=c("TEU_BaC_AgeCat","BaC_Sex","TEU_ethnicgrp","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+columns_PRS=c(columns,"PRS_quintiles")
+
+# Make duplicate columns for variables to be transferred to corresponding scores
+
+rs_train<-cbind(tot_train,
+                setNames(tot_train[columns], paste0("Eth_", columns)),
+                setNames(tot_train[columns_PRS], paste0("NRSPRS_", columns_PRS)))
+
+# 2. Compute the risk score
+#https://dplyr.tidyverse.org/reference/recode.html#ref-usage
+rs_train<-rs_train%>%
+  # Compute enhanced risk score 1
+  mutate_at(paste0("Eth_",columns), ~recode(.,!!!Eth_betas_list))%>%
+  mutate(Eth_rs=rowSums(select(.,starts_with("Eth_"))))%>%
+  # Compute enhanced risk score 2
+  # Essential to add .default=0 because the beta list doesn't have all possible levels (e.g. 40-49 Yes high BP)
+  mutate_at(paste0("NRSPRS_",columns_PRS), ~recode(.,!!!PRS_betas_list,.default = 0))%>%
+  mutate(PRS_rs=rowSums(select(.,starts_with("NRSPRS_"))))%>%
+  # create status at 10 years
+  mutate(T2D10_status=ifelse(SA_T2DM_status==1 & SA_T2DM_time<=10,1,0))
+
+```
+
+
+```{r compute new risk scores test}
+
+# Make duplicate columns for variables to be transferred to corresponding scores
+
+rs_test<-cbind(tot_test,
+               setNames(tot_test[columns], paste0("Eth_", columns)),
+               setNames(tot_test[columns_PRS], paste0("NRSPRS_", columns_PRS)))
+
+# 2. Compute the risk score using age int scoring
+#https://dplyr.tidyverse.org/reference/recode.html#ref-usage
+rs_test<-rs_test%>%
+  # Compute enhanced risk score 1
+  mutate_at(paste0("Eth_",columns), ~recode(.,!!!Eth_betas_list))%>%
+  mutate(Eth_rs=rowSums(select(.,starts_with("Eth_"))))%>%
+  # Compute enhanced risk score 2
+  # Essential to add .default=0 because the beta list doesn't have all possible levels (e.g. 40-49 Yes high BP)
+  mutate_at(paste0("NRSPRS_",columns_PRS), ~recode(.,!!!PRS_betas_list,.default = 0))%>%
+  mutate(PRS_rs=rowSums(select(.,starts_with("NRSPRS_"))))%>%
+  # create status at 10 years
+  mutate(T2D10_status=ifelse(SA_T2DM_status==1 & SA_T2DM_time<=10,1,0))
+
+```
+
+
+## Summary stats of scores
+
+The summary statistics of the original Leicester score, enhanced scores (without PRS), and enhanced scores (with PRS) in the training data:
+
+```{r,results='asis'}
+
+scores=c("diab_rs","Eth_rs","PRS_rs")
+
+rs_train$Indicator="Training data"
+rs_test$Indicator="Test data"
+
+tmp<-rbind(rs_train[,c("Indicator",scores)],rs_test[,c("Indicator",scores)])
+
+# Descrp stats by training-test indicator
+
+table<-tableby(Indicator~diab_rs+Eth_rs+PRS_rs,data=tmp,control=my_controls)
+
+sumtab=summary(table,labelTranslations = pretty_names,title=paste0('Summary statistics of the Leicester risk scores, enhanced scores (without PRS), and enhanced scores (with PRS).'))
+
+sumtab
+
+```
+
+
+```{r optimal cutoffs}
+# Use cutpointr package to determine the optimal cut-off point for our new risk score
+
+# Choose threshold based on balance of Sens and Spec, prioritise Sens
+# 60% seems a good fit
+Leicrs16_perc=round((rs_train%>%filter(diab_rs<16)%>%nrow()/nrow(rs_train))*100,0)
+
+Eth_threshold=quantile(rs_train$Eth_rs,Leicrs16_perc/100)
+
+PRS_threshold=quantile(rs_train$PRS_rs,Leicrs16_perc/100) 
+
+```
+
+
+**Choosing a cutoff**: We used 16 as the cutoff values for the Leicester score. Cutoff 16 corresponds to `r Leicrs16_perc` percentile of the Leicester risk score (i.e. what percentage of people had their Leicester score below 16.).
+
+We used this percentile as the cutoffs for the other two enhanced scores. Hence, the cutoff for the enhanced Leicester score (without PRS) is `r Eth_threshold` and the cutoff for the enhanced Leicester score (with PRS) is `r PRS_threshold`. 
+We found those scores at `r Leicrs16_perc` percentile are reasonable cutoffs based on the sensitivity and specificity.
+
+```{r summary stats new score}
+
+long_train<-rs_train%>%
+  select(ID,SA_T2DM_status,T2D10_status,diab_rs,Eth_rs,PRS_rs)%>%
+  pivot_longer(!c("ID","SA_T2DM_status","T2D10_status"), names_to = "Score", values_to = "Value")%>%
+  mutate(Score=factor(Score,levels = c("diab_rs","Eth_rs","PRS_rs")))
+
+
+```
+
+```{r Create annotation for histograms,message=FALSE}
+
+# Categorise individuals to low (1) and high risk (2) groups
+rs_train$diab_rs_binary<-ifelse(rs_train$diab_rs<16,1,2)
+rs_train$Eth_rs_binary<-ifelse(rs_train$Eth_rs<Eth_threshold,1,2)
+rs_train$PRS_rs_binary<-ifelse(rs_train$PRS_rs<PRS_threshold,1,2)
+
+```
+
+```{r summary stats new score test}
+
+# Histogtam 
+long_test<-rs_test%>%
+  select(ID,SA_T2DM_status,T2D10_status,diab_rs,Eth_rs,PRS_rs)%>%
+  pivot_longer(!c("ID","SA_T2DM_status","T2D10_status"), names_to = "Score", values_to = "Value")%>%
+  mutate(Score=factor(Score,levels = c("diab_rs","Eth_rs","PRS_rs")))
+
+
+```
+
+## Model performance in the training data
+
+### AUC
+
+We assess the outcome of T2D diagnosed within 10 years. Title: ROC Curve for risk scores using training data N=`r nrow(tot_train)`.
+
+```{r AUC training CI}
+
+AUC_training<-sapply(c("diab_rs","Eth_rs","PRS_rs"),function(i) AUC_CI(df=rs_train,score=i,status = "T2D10_status"))
+
+
+AUC_training_label=c(
+  paste0("LRA Score: ",AUC_training[1]),
+  paste0("LRArev Score: ",AUC_training[2]),
+  paste0("LRAprs Score: ",AUC_training[3])
+)
+
+#tiff(file.path(config$outputs$figures,"ROC_training.tiff"), units="in", width=8, height=5, res=300)
+
+# Try different format presenting ROC curve from below
+ggplot(long_train,aes(d=T2D10_status, m=Value,color=Score))+geom_roc(n.cuts = 0,linealpha = 1,size=1)+
+  style_roc()+
+  #scale_color_manual(values=cbPalette)
+  scale_color_manual(name="AUC (95% CI)",labels =  AUC_training_label,values = c("#F8766D","#00BA38", "#6193FF")) +
+  labs(title ="",caption = "")
+
+#dev.off()
+```
+
+```{r ROC linetype}
+
+ggplot(long_train,aes(d=T2D10_status, m=Value,linetype=Score))+geom_roc(n.cuts = 0,linealpha = 1,size=1)+
+  style_roc()+
+  scale_linetype_manual(name="AUC (95% CI)",labels =  AUC_training_label,values=c( "solid","longdash","dotted"))+
+  labs(title ="",caption = "")
+
+```
+
+
+
+### NRI
+
+We have three scores: 1) the Leicester scores, 2) the enhanced scores (without PRS), and 3) the enhanced scores (with PRS). Since the NRI is for pair-wise comparison between scores, we computed the NRI for the following 3 comparisons:
+
+* Leicester scores vs enhanced scores(without PRS)
+* Enhanced scores (without PRS) vs enhanced scores (with PRS)
+* Leicester scores vs enhanced scores (with PRS)
+
+
+**Comparison 1: Leicester scores vs enhanced scores (without PRS)**:
+
+* Step 1: Categorise individuals based on the Leicester risk scores to two risk groups: "Low: <16" and "High: $\ge$ 16". Note: 16 is the established risk threshold for the Leicester risk score.
+
+* Step 2: Categorise individuals based on the enhanced scores (without PRS) to two risk groups: "Low:< `r Eth_threshold`" and "High: $\ge$ `r Eth_threshold`".
+
+* Step 3: Compute the categorical NRI with the incident T2D within 10 years. 
+
+
+```{r NRI training,echo=FALSE}
+
+# reclassification table
+reclassification_table(rs_train, match("T2D10_status",names(rs_train)), rs_train$diab_rs_binary, rs_train$Eth_rs_binary, cutoff=c(1,2,3),cutoff_label = c("Low","High"))
+
+
+# Below produces the same point estimate as pct.nri_XL but much faster for CI computation!
+set.seed(100)
+perc_nri_train<-nribin(event=rs_train$T2D10_status,
+        p.std = rs_train$diab_rs_binary,p.new = rs_train$Eth_rs_binary,updown = 'category',
+        cut = 2)
+
+
+perc_nri_train_tb<-as.data.frame(perc_nri_train$nri)[1:3,]%>%
+  mutate(NRI=c("Overall NRI","NRI for cases","NRI for controls"),
+         Estimate=pretty_dp(Estimate,3),
+         `95% CI`=pretty_confint(Lower,Upper,dp=3))%>%
+  select(NRI,Estimate,`95% CI`)
+  
+rownames(perc_nri_train_tb)=NULL  
+
+```
+
+```{r}
+pander(perc_nri_train_tb,caption = "NRI results comparing the Leicester score and the enhanced score (without PRS) computed using the training data") 
+
+```
+
+
+
+**Comparison 2: Enhanced scores (without PRS) vs enhanced scores (with PRS)**:
+
+We performed the similar steps:
+
+* Step 1: Categorise individuals based on the enhanced scores (without PRS) to two risk groups: "Low:< `r Eth_threshold`" and "High: $\ge$ `r Eth_threshold`".
+
+* Step 2: Categorise individuals based on the enhanced scores (with PRS) to two risk groups: "Low:< `r PRS_threshold`" and "High: $\ge$ `r PRS_threshold`".
+
+* Step 3: Compute the categorical NRI with the incident T2D within 10 years. 
+
+
+```{r NRI training 2,echo=FALSE}
+
+# Categorise individuals to low (1) and high risk (2) groups
+
+# reclassification table
+reclassification_table(rs_train, match("T2D10_status",names(rs_train)), rs_train$Eth_rs_binary, rs_train$PRS_rs_binary, cutoff=c(1,2,3),cutoff_label = c("Low","High"))
+
+# Below produces the same point estimate as pct.nri_XL but much faster for CI computation!
+set.seed(100)
+perc_nri_train2<-nribin(event=rs_train$T2D10_status,
+        p.std = rs_train$Eth_rs_binary,p.new = rs_train$PRS_rs_binary,updown = 'category',
+        cut = 2)
+
+perc_nri_train2_tb<-as.data.frame(perc_nri_train2$nri)[1:3,]%>%
+  mutate(NRI=c("Overall NRI","NRI for cases","NRI for controls"),
+         Estimate=pretty_dp(Estimate,3),
+         `95% CI`=pretty_confint(Lower,Upper,dp=3))%>%
+  select(NRI,Estimate,`95% CI`)
+  
+rownames(perc_nri_train2_tb)=NULL  
+```
+
+```{r}
+pander(perc_nri_train2_tb,caption = "NRI results comparing the enhanced score (without PRS) and the enhanced score (with PRS) computed using the training data")  
+
+```
+
+**Comparison 3: Leicester score vs enhanced scores (with PRS)**:
+
+We performed the similar steps:
+
+* Step 1: Categorise individuals based on the Leicester score to two risk groups: "Low:< 16" and "High: $\ge$ 16".
+
+* Step 2: Categorise individuals based on the enhanced scores (with PRS) to two risk groups: "Low:< `r PRS_threshold`" and "High: $\ge$ `r PRS_threshold`".
+
+* Step 3: Compute the categorical NRI with the incident T2D within 10 years. 
+
+
+```{r NRI training 3,echo=FALSE}
+
+# Categorise individuals to low (1) and high risk (2) groups
+
+# reclassification table
+reclassification_table(rs_train, match("T2D10_status",names(rs_train)), rs_train$diab_rs_binary, rs_train$PRS_rs_binary, cutoff=c(1,2,3),cutoff_label = c("Low","High"))
+
+
+# Below produces the same point estimate as pct.nri_XL but much faster for CI computation!
+perc_nri_train3<-nribin(event=rs_train$T2D10_status,
+        p.std = rs_train$diab_rs_binary,p.new = rs_train$PRS_rs_binary,updown = 'category',
+        cut = 2)
+
+perc_nri_train3_tb<-as.data.frame(perc_nri_train3$nri)[1:3,]%>%
+  mutate(NRI=c("Overall NRI","NRI for cases","NRI for controls"),
+         Estimate=pretty_dp(Estimate,3),
+         `95% CI`=pretty_confint(Lower,Upper,dp=3))%>%
+  select(NRI,Estimate,`95% CI`)
+  
+rownames(perc_nri_train3_tb)=NULL  
+```
+
+```{r}
+pander(perc_nri_train3_tb,caption = "NRI results comparing the Leicester score and the enhanced score (with PRS) computed using the training data")  
+
+```
+
+
+## Model performance in the test data
+
+
+### AUC
+
+We assess the outcome of T2D diagnosed within 10 years. Title: ROC Curve for risk scores using test data N= `r nrow(tot_test)`.
+
+```{r AUC test CI}
+
+AUC_test<-sapply(c("diab_rs","Eth_rs","PRS_rs"),function(i) AUC_CI(df=rs_test,score=i,status = "T2D10_status"))
+
+
+AUC_test_label=c(
+  paste0("LRA Score: ",AUC_test[1]),
+  paste0("LRArev Score: ",AUC_test[2]),
+  paste0("LRAprs Score: ",AUC_test[3])
+)
+
+
+# Statistical test for comparing AUC
+#roc.test(roccurve1, roccurve2, method="bootstrap", boot.n=1000)
+#roc.test(roccurve2, roccurve3, method="bootstrap", boot.n=1000)
+
+# Try different format presenting ROC curve from below
+ggplot(long_test,aes(d=T2D10_status, m=Value,color=Score))+geom_roc(n.cuts = 0,linealpha = 1,size=1)+
+  style_roc()+
+  #scale_color_discrete()+
+  scale_color_manual(name="AUC (95% CI)",labels =  AUC_test_label,values = c("#F8766D","#00BA38", "#6193FF")) +
+  labs(title ="",caption = "")
+
+```
+
+
+### NRI
+
+**Comparison 1: Leicester scores vs enhanced scores (without PRS)**:
+
+* Step 1: Categorise individuals based on the Leicester risk scores to two risk groups: "Low: <16" and "High: $\ge$ 16". Note: 16 is the established risk threshold for the Leicester risk score.
+
+* Step 2: Categorise individuals based on enhanced scores (without PRS) to two risk groups: "Low:< `r Eth_threshold`" and "High: $\ge$ `r Eth_threshold`". Note: the cutoff is derived using the training data.
+
+* Step 4: Compute the categorical NRI with the incident T2D within 10 years. 
+
+
+```{r NRI test,echo=FALSE}
+
+# Categorise individuals to low (1) and high risk (2) groups
+rs_test$diab_rs_binary<-ifelse(rs_test$diab_rs<16,1,2)
+rs_test$Eth_rs_binary<-ifelse(rs_test$Eth_rs<Eth_threshold,1,2)
+
+# reclassification table
+reclassification_table(rs_test, match("T2D10_status",names(rs_test)), rs_test$diab_rs_binary, rs_test$Eth_rs_binary, cutoff=c(1,2,3),cutoff_label = c("Low","High"))
+
+# Below produces the same point estimate as pct.nri_XL but much faster for CI computation!
+set.seed(100)
+perc_nri_test<-nribin(event=rs_test$T2D10_status,
+        p.std = rs_test$diab_rs_binary,p.new = rs_test$Eth_rs_binary,updown = 'category',
+        cut = 2)
+
+perc_nri_test_tb<-as.data.frame(perc_nri_test$nri)[1:3,]%>%
+  mutate(NRI=c("Overall NRI","NRI for cases","NRI for controls"),
+         Estimate=pretty_dp(Estimate,3),
+         `95% CI`=pretty_confint(Lower,Upper,dp=3))%>%
+  select(NRI,Estimate,`95% CI`)
+  
+rownames(perc_nri_test_tb)=NULL  
+```
+
+```{r}
+pander(perc_nri_test_tb,caption = "NRI results comparing the Leicester score and the enhanced score (without PRS) computed using the test data")  
+
+```
+
+
+**Comparison 2: Enhanced score (without PRS) vs enhanced score (with PRS)**
+
+```{r NRI test 2,echo=FALSE}
+
+# Categorise individuals to low (1) and high risk (2) groups
+
+rs_test$PRS_rs_binary<-ifelse(rs_test$PRS_rs<PRS_threshold,1,2)
+
+# reclassification table
+reclassification_table(rs_test, match("T2D10_status",names(rs_test)), rs_test$Eth_rs_binary, rs_test$PRS_rs_binary, cutoff=c(1,2,3),cutoff_label = c("Low","High"))
+
+
+# Below produces the same point estimate as pct.nri_XL but much faster for CI computation!
+set.seed(100)
+perc_nri_test2<-nribin(event=rs_test$T2D10_status,
+        p.std = rs_test$Eth_rs_binary,p.new = rs_test$PRS_rs_binary,updown = 'category',
+        cut = 2)
+
+perc_nri_test2_tb<-as.data.frame(perc_nri_test2$nri)[1:3,]%>%
+  mutate(NRI=c("Overall NRI","NRI for cases","NRI for controls"),
+         Estimate=pretty_dp(Estimate,3),
+         `95% CI`=pretty_confint(Lower,Upper,dp=3))%>%
+  select(NRI,Estimate,`95% CI`)
+  
+rownames(perc_nri_test2_tb)=NULL  
+```
+
+```{r}
+pander(perc_nri_test2_tb,caption = "NRI results comparing the enhanced score (without PRS) and the enhanced score (with PRS) computed using the test data")  
+
+```
+
+**Comparison 3: Leicester score vs enhanced score (with PRS)**
+
+```{r NRI test 3,echo=FALSE}
+
+
+# reclassification table
+reclassification_table(rs_test, match("T2D10_status",names(rs_test)), rs_test$diab_rs_binary, rs_test$PRS_rs_binary, cutoff=c(1,2,3),cutoff_label = c("Low","High"))
+
+# Below produces the same point estimate as pct.nri_XL but much faster for CI computation!
+set.seed(100)
+perc_nri_test3<-nribin(event=rs_test$T2D10_status,
+        p.std = rs_test$diab_rs_binary,p.new = rs_test$PRS_rs_binary,updown = 'category',
+        cut = 2)
+
+perc_nri_test3_tb<-as.data.frame(perc_nri_test3$nri)[1:3,]%>%
+  mutate(NRI=c("Overall NRI","NRI for cases","NRI for controls"),
+         Estimate=pretty_dp(Estimate,3),
+         `95% CI`=pretty_confint(Lower,Upper,dp=3))%>%
+  select(NRI,Estimate,`95% CI`)
+  
+rownames(perc_nri_test3_tb)=NULL  
+```
+
+```{r}
+pander(perc_nri_test3_tb,caption = "NRI results comparing the Leicester score and the enhanced score (with PRS) computed using the test data")  
+
+```
+

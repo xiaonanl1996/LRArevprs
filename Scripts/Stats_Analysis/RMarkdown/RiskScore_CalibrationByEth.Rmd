@@ -1,0 +1,614 @@
+---
+title: "Calibration of Leicester score and enhanced scores by ethnicity"
+author: "XL,TL,JC,LC,DH"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  word_document:
+      fig_width: 8
+      fig_height: 5
+      reference_docx: "K:/TEU/TEU_Guides/TEU_DocStyle_Rmd_2020.dotx"
+---
+
+**Keywords**: 45% of the cohort, incident T2D derived from HES/Dth/PC censored till 2016.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE)
+
+library(kableExtra)
+library(knitr)
+library(yaml)
+library(here)
+library(ggplot2)
+library(tidyr)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(magrittr)
+library(svglite)
+library(rsvg)
+library(png)
+library(dplyr)
+library(survival)
+library(survminer)
+library(Rcpp)
+library(summarytools)
+library(arsenal)
+library(pander)
+library(ggeffects)
+library(sjPlot)
+library(etm)
+library(readr)
+library(tibble)
+library(ResourceSelection)
+library(Publish)
+library(rsample)
+library(plotROC)
+library(pROC)
+library(nricens)
+library(PredictABEL)
+library(cutpointr)
+library(caret)
+library(gridExtra)
+library(riskRegression)
+library(gtools)
+library(ggsurvfit)
+# Specify the markdown format for knitr tables, otherwise they're not compatible with kableExtra
+#options(knitr.kable.NA='', knitr.table.format = "html")
+#options(kableExtra.auto_format = FALSE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+source(here::here(config$functions))
+source(here::here(config$scripts$nri))
+
+my_controls <- tableby.control(
+    test = F,
+    total = T,
+    #numeric.test = "kwt", cat.test = "chisq",
+    numeric.stats = c("meansd", "medianq1q3", "range", "Nmiss"), 
+    cat.stats = c("countpct", "Nmiss"),
+    stats.labels = list(
+      meansd = "Mean (SD)",
+      medianq1q3 = "Median (IQR)",
+      range = "Min - Max",
+      Nmiss = "Missing",
+      Npct="N (Pct)"
+    ),
+    digits = 2L
+  )
+
+# Read in data derived from code chunk below
+data<-readRDS(here::here(file.path(config$data$derived,"data_Leicrs.RDS")))
+
+tot_train<-readRDS(here::here(file.path(config$data$derived,"tot_train.rds")))
+tot_test<-readRDS(here::here(file.path(config$data$derived,"tot_test.rds")))
+
+
+```
+
+```{r,include=FALSE}
+source(file.path(config$scripts$cleaning, "dataset_generator.R"))
+
+pretty_func <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type = "function")
+pretty_names <- pretty_switch(field_definitions=TEU_SPECS$T2DM_PRS, return_type="list")
+
+pretty_names$hba1c_cat="HbA1c at baseline"
+pretty_names$hba1c_cat2="HbA1c at baseline"
+
+pretty_names$BSM_WaistCirc_Cat="Waist circumference,cm"
+pretty_names$BSM_BMI_Cat="BMI"
+pretty_names$HighBP="Antihypertensive meds or high blood pressure"
+pretty_names$diab_rs_cat="Leicester risk score"
+pretty_names$PRS_quintiles="T2D PRS quintiles"
+pretty_names$Ethnicity="Ethnicity"
+
+pretty_names$diab_rs="LRA Score"
+pretty_names$Eth_rs="LRArev Score"
+pretty_names$PRS_rs="LRAprs Score"
+```
+
+
+# KM plot by quintiles of predicted risk 
+
+First we would like to produce the KM plots by quintiles of predicted risk in training and test data respectively. According to the plots from both training and test data, we could choose the maximum follow-up years across the quintiles (say 9-years) and then compute the observed 9-year risk throughout.
+
+```{r pred prob Leicrs}
+
+tot_train<-tot_train%>%select(!starts_with("RS_"))
+
+# Leicester risk score vars
+columns=c("TEU_BaC_AgeCat","BaC_Sex","Ethnicity","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+rs_train<-cbind(tot_train, setNames(tot_train[columns], paste0("RS_", columns)))
+
+rs_train<-rs_train%>%
+  mutate_at(paste0("RS_",columns), ~var_to_beta(.))
+
+# Sum all the columns starting with RS_
+
+rs_train<-rs_train%>%
+  mutate(sum_beta=-3.430668+rowSums(select(.,starts_with("RS_"))))%>%
+  mutate(Leicrs_prob=exp(sum_beta)/(1+exp(sum_beta)))
+
+
+```
+
+KM plots using the training data:
+
+```{r KM Leicester}
+
+predRisk = "Leicrs_prob";times=10;groups = 5
+
+for (i in levels(rs_train$TEU_ethnicgrp)) {
+  
+  ethnic_grp<-rs_train%>%
+  filter(TEU_ethnicgrp==i)%>%
+  mutate(
+     pred_deciles=Percentile((!!sym(predRisk)),probs=seq(0, 1, 1/groups),labels = c(1:groups),right=TRUE))
+
+ KM_plot<-survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_deciles, data = ethnic_grp) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years",
+    y = "Overall survival probability",
+    title = paste0("KM plot by quintiles of Leicester probability \n among ",i, " (Training)")
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+ 
+ print(KM_plot)
+}
+
+
+```
+
+```{r}
+
+# Model 1: Ethnicity + other Leicester vars
+
+RFs=c("TEU_BaC_AgeCat","BaC_Sex","TEU_ethnicgrp","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+formula<-as.formula(paste0("Surv(TEU_T2DM_time,TEU_T2DM_status)~",
+                           paste(RFs, collapse="+")))
+
+
+Eth_model<-coxph(formula,data = tot_train,x=TRUE)
+
+# Create list of betas 
+Eth_model_betas<-Eth_model$coefficients
+
+Eth_model_betas<-data.frame(round(Eth_model_betas*10,0))
+
+Eth_model_betas <- tibble::rownames_to_column(Eth_model_betas, "VALUE")
+colnames(Eth_model_betas)<-c("VALUE","New Score 1")
+
+# Present our model 
+Eth_model_output<-printcoxresults(df=tot_train,varlist=RFs,modeloutput = Eth_model,pretty_names=pretty_names,forplot = FALSE,print_beta = TRUE,IDcol = TRUE)
+
+```
+
+```{r PRS model}
+
+# Fit a model
+vars=c(RFs,"PRS_quintiles","GeP_Array")
+
+formula<-as.formula(paste0("Surv(TEU_T2DM_time,TEU_T2DM_status)~",
+                           paste(vars, collapse="+")))
+
+
+PRS_model<-coxph(formula,data = tot_train,x=TRUE)
+
+```
+
+
+```{r}
+# Compute the predicted probability
+rs_train<-rs_train%>%
+  mutate(# Predicted 10-year risk score (RS)
+    eth_prob10=1-predictCox(Eth_model,times=10,newdata = rs_train)$survival,
+    eth_PRS_prob10=1-predictCox(PRS_model,times=10, newdata = rs_train)$survival,
+    # 9 year risk
+    eth_prob9=1-predictCox(Eth_model,times=9,newdata = rs_train)$survival,
+    eth_PRS_prob9=1-predictCox(PRS_model,times=9, newdata = rs_train)$survival,
+    # 5 year risk 
+    eth_prob5=1-predictCox(Eth_model,times=5,newdata = rs_train)$survival,
+    eth_PRS_prob5=1-predictCox(PRS_model,times=5, newdata = rs_train)$survival)
+
+```
+
+
+```{r KM enhanced without PRS}
+
+predRisk = "eth_prob10";times=10;groups = 5
+
+for (i in levels(rs_train$TEU_ethnicgrp)) {
+  
+  ethnic_grp<-rs_train%>%
+  filter(TEU_ethnicgrp==i)%>%
+  mutate(
+     pred_deciles=Percentile((!!sym(predRisk)),probs=seq(0, 1, 1/groups),labels = c(1:groups),right=TRUE))
+
+ KM_plot<-survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_deciles, data = ethnic_grp) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years",
+    y = "Overall survival probability",
+    title = paste0("KM plot by quintiles of enhanced Leicester probability (without PRS) \n among ",i," (Training)")
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+ 
+ print(KM_plot)
+}
+
+
+```
+
+
+```{r KM enhanced with PRS}
+
+predRisk = "eth_PRS_prob10";times=10;groups = 5
+
+for (i in levels(rs_train$TEU_ethnicgrp)) {
+  
+  ethnic_grp<-rs_train%>%
+  filter(TEU_ethnicgrp==i)%>%
+  mutate(
+     pred_deciles=Percentile((!!sym(predRisk)),probs=seq(0, 1, 1/groups),labels = c(1:groups),right=TRUE))
+
+ KM_plot<-survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_deciles, data = ethnic_grp) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years",
+    y = "Overall survival probability",
+    title = paste0("KM plot by quintiles of enhanced Leicester probability (with PRS) among ",i," (Training)")
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+ 
+ print(KM_plot)
+}
+
+
+```
+KM plots in test data:
+
+```{r pred prob test data}
+
+tot_test<-tot_test%>%select(!starts_with("RS_"))
+
+# Leicester risk score vars
+columns=c("TEU_BaC_AgeCat","BaC_Sex","Ethnicity","TEU_FaH_diab","BSM_WaistCirc_Cat","BSM_BMI_Cat","HighBP")
+
+rs_test<-cbind(tot_test, setNames(tot_test[columns], paste0("RS_", columns)))
+
+rs_test<-rs_test%>%
+  mutate_at(paste0("RS_",columns), ~var_to_beta(.))
+
+# Sum all the columns starting with RS_
+
+rs_test<-rs_test%>%
+  mutate(sum_beta=-3.430668+rowSums(select(.,starts_with("RS_"))))%>%
+  mutate(Leicrs_prob=exp(sum_beta)/(1+exp(sum_beta)))%>%
+  mutate(# Predicted 10-year risk score (RS)
+    eth_prob10=1-predictCox(Eth_model,times=10,newdata = tot_test)$survival,
+    eth_PRS_prob10=1-predictCox(PRS_model,times=10, newdata = tot_test)$survival)
+
+```
+
+```{r KM Leicester test}
+
+predRisk = "Leicrs_prob";times=10;groups = 5
+
+for (i in levels(rs_test$TEU_ethnicgrp)) {
+  
+  ethnic_grp<-rs_test%>%
+  filter(TEU_ethnicgrp==i)%>%
+  mutate(
+     pred_deciles=Percentile((!!sym(predRisk)),probs=seq(0, 1, 1/groups),labels = c(1:groups),right=TRUE))
+
+ KM_plot<-survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_deciles, data = ethnic_grp) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years",
+    y = "Overall survival probability",
+    title = paste0("KM plot by quintiles of Leicester probability \n among ",i," (Test)")
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+ 
+ print(KM_plot)
+}
+
+
+```
+
+
+```{r KM enhanced without PRS test}
+
+predRisk = "eth_prob10";times=10;groups = 5
+
+for (i in levels(rs_test$TEU_ethnicgrp)) {
+  
+  ethnic_grp<-rs_test%>%
+  filter(TEU_ethnicgrp==i)%>%
+  mutate(
+     pred_deciles=Percentile((!!sym(predRisk)),probs=seq(0, 1, 1/groups),labels = c(1:groups),right=TRUE))
+
+ KM_plot<-survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_deciles, data = ethnic_grp) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years",
+    y = "Overall survival probability",
+    title = paste0("KM plot by quintiles of enhanced score (without PRS) \n among ",i," (Test)")
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+ 
+ print(KM_plot)
+}
+
+
+```
+
+```{r KM enhanced with PRS test}
+
+predRisk = "eth_PRS_prob10";times=10;groups = 5
+
+for (i in levels(rs_test$TEU_ethnicgrp)) {
+  
+  ethnic_grp<-rs_test%>%
+  filter(TEU_ethnicgrp==i)%>%
+  mutate(
+     pred_deciles=Percentile((!!sym(predRisk)),probs=seq(0, 1, 1/groups),labels = c(1:groups),right=TRUE))
+
+ KM_plot<-survfit2(Surv(TEU_T2DM_time,TEU_T2DM_status) ~ pred_deciles, data = ethnic_grp) %>% 
+  ggsurvfit() +
+  labs(
+    x = "Years",
+    y = "Overall survival probability",
+    title = paste0("KM plot by quintiles of enhanced score (with PRS) \n among ",i," (Test)")
+    ) + 
+  add_confidence_interval() +
+  scale_x_continuous(breaks = seq(0,12,2)) +
+  add_risktable()
+ 
+ print(KM_plot)
+}
+
+
+```
+The maximum follow-up of quintile 4 of enhanced score (with PRS) in test data was less than 9 years so we compute the observed risk at 8 years as an approximate of observed risk at 10 years.
+
+# Leicester score (Training)
+
+Title: Calibration plot of the Leicester score with 10-year risk of T2D using the training data.
+
+```{r Leicprob calibration}
+
+#table(rs_train$TEU_ethnicgrp)
+
+Leic10_cal<-lapply(levels(rs_train$TEU_ethnicgrp), 
+       function(i) Calibration_df(data=rs_train%>%filter(TEU_ethnicgrp==i),
+                                  predRisk = "Leicrs_prob",groups = 5,
+                                  times = 8, format = "wide")%>%
+         mutate(Eth=i))%>% bind_rows()
+
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+# Reorder display 
+Leic10_cal$Eth<-factor(Leic10_cal$Eth,levels = levels(rs_train$TEU_ethnicgrp))
+
+ggplot(Leic10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  facet_wrap(~ Eth, ncol=2) +
+  scale_x_continuous(limits = c(0,0.5)) +
+  scale_y_continuous(limits=c(0,0.5)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+# Enhanced score without PRS (Training)
+
+Title: Calibration plot of the enhanced score (without PRS) with 10-year risk of T2D using the training data.
+
+```{r enh without PRS calibration}
+
+#table(rs_train$TEU_ethnicgrp)
+
+eth10_cal<-lapply(levels(rs_train$TEU_ethnicgrp), 
+       function(i) Calibration_df(data=rs_train%>%filter(TEU_ethnicgrp==i),
+                                  predRisk = "eth_prob10",groups = 5,
+                                  times = 8, format = "wide")%>%
+         mutate(Eth=i))%>% bind_rows()
+
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+# Reorder display 
+eth10_cal$Eth<-factor(eth10_cal$Eth,levels = levels(rs_train$TEU_ethnicgrp))
+
+ggplot(eth10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  facet_wrap(~ Eth, ncol=2) +
+  scale_x_continuous(limits = c(0,0.5)) +
+  scale_y_continuous(limits=c(0,0.5)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+# Enhanced score with PRS (Training)
+
+Title: Calibration plot of the enhanced score (with PRS) with 10-year risk of T2D \n using the training data.
+
+```{r enh with PRS calibration}
+
+#table(rs_train$TEU_ethnicgrp)
+
+ethPRS10_cal<-lapply(levels(rs_train$TEU_ethnicgrp), 
+       function(i) Calibration_df(data=rs_train%>%filter(TEU_ethnicgrp==i),
+                                  predRisk = "eth_PRS_prob10",groups = 5,
+                                  times = 8, format = "wide")%>%
+         mutate(Eth=i))%>% bind_rows()
+
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+# Reorder display 
+ethPRS10_cal$Eth<-factor(ethPRS10_cal$Eth,levels = levels(rs_train$TEU_ethnicgrp))
+
+ggplot(ethPRS10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  facet_wrap(~ Eth, ncol=2) +
+  scale_x_continuous(limits = c(0,0.5)) +
+  scale_y_continuous(limits=c(0,0.5)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+
+# Leicester score (Test)
+
+Title: Calibration plot of the Leicester score with 10-year risk of T2D using the test data.
+
+```{r Leicprob calibration test}
+
+#table(rs_train$TEU_ethnicgrp)
+
+Leic10_cal<-lapply(levels(rs_test$TEU_ethnicgrp), 
+       function(i) Calibration_df(data=rs_test%>%filter(TEU_ethnicgrp==i),
+                                  predRisk = "Leicrs_prob",groups = 5,
+                                  times = 8, format = "wide")%>%
+         mutate(Eth=i))%>% bind_rows()
+
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+# Reorder display 
+Leic10_cal$Eth<-factor(Leic10_cal$Eth,levels = levels(rs_test$TEU_ethnicgrp))
+
+ggplot(Leic10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  facet_wrap(~ Eth, ncol=2) +
+  scale_x_continuous(limits = c(0,0.5)) +
+  scale_y_continuous(limits=c(0,0.5)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+# Enhanced score without PRS (Test)
+
+Title: Calibration plot of the enhanced score (without PRS) with 10-year risk of T2D using the test data.
+
+```{r enh without PRS calibration test}
+
+#table(rs_train$TEU_ethnicgrp)
+
+eth10_cal<-lapply(levels(rs_test$TEU_ethnicgrp), 
+       function(i) Calibration_df(data=rs_test%>%filter(TEU_ethnicgrp==i),
+                                  predRisk = "eth_prob10",groups = 5,
+                                  times = 8, format = "wide")%>%
+         mutate(Eth=i))%>% bind_rows()
+
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+# Reorder display 
+eth10_cal$Eth<-factor(eth10_cal$Eth,levels = levels(rs_test$TEU_ethnicgrp))
+
+ggplot(eth10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  facet_wrap(~ Eth, ncol=2) +
+  scale_x_continuous(limits = c(0,0.5)) +
+  scale_y_continuous(limits=c(0,0.5)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+# Enhanced score with PRS (Test)
+
+Title: Calibration plot of the enhanced score (with PRS) with 10-year risk of T2D using the test data.
+
+```{r enh with PRS calibration test}
+
+#table(rs_train$TEU_ethnicgrp)
+
+ethPRS10_cal<-lapply(levels(rs_test$TEU_ethnicgrp), 
+       function(i) Calibration_df(data=rs_test%>%filter(TEU_ethnicgrp==i),
+                                  predRisk = "eth_PRS_prob10",groups = 5,
+                                  times = 8, format = "wide")%>%
+         mutate(Eth=i))%>% bind_rows()
+
+
+#plot(pred_obs_wide$value.pred,pred_obs_wide$value.obs,main="",#xlab="",ylab="",
+#pch=16,ps=2, xlim=c(0,0.4) , ylim=c(0,0.4),cex.lab=1.2,
+#cex.axis=1.1, las=1)
+#lines(x =c(0,1),y=c(0,1))
+
+# Reorder display 
+ethPRS10_cal$Eth<-factor(ethPRS10_cal$Eth,levels = levels(rs_test$TEU_ethnicgrp))
+
+ggplot(ethPRS10_cal, aes(value.pred, value.obs))+
+  geom_point(shape=15,size=3,colour="blue")+
+  geom_abline(intercept = 0,slope=1,linetype="dashed")+
+  facet_wrap(~ Eth, ncol=2) +
+  scale_x_continuous(limits = c(0,0.5)) +
+  scale_y_continuous(limits=c(0,0.5)) +
+  labs(x="Predicted risk",y="Observed risk",title="")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
